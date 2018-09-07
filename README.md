@@ -39,6 +39,7 @@ This is a fork of ioerror's version of sslscan (the original readme of which is 
 * Check for TLS Fallback SCSV support.
 * Added StartTLS support for LDAP `--starttls-ldap`.
 * Added SNI support `--sni-name` (credit Ken).
+* Support STARTTLS for MySQL (credit bk2017).
 
 ### Building on Windows
 Thanks to a patch by jtesta, sslscan can now be compiled on Windows. This can
@@ -59,6 +60,17 @@ required to compile OpenSSL from source on OS X. Once you have, just run:
     make static
 
 ### OpenSSL issues
+
+#### OpenSSL 1.1.0 Support
+OpenSSL 1.1.0 introduced a number of significant changes, including the removal
+of old and insecure features such as SSLv2. While this is a very good thing for
+the SSL ecosystem as a whole, it is a problem for sslscan, which relies on
+these legacy features being available in order to detect them on client system.
+
+In order to work around this, sslscan builds against [Peter Mosmans'](https://github.com/PeterMosmans/openssl)
+fork of OpenSSL, which backports the Chacha20 and Poly1305 ciphers to OpenSSL
+1.0.2, while keeping the dangerous legacy features (such as SSLv2 and EXPORT
+ciphers) enabled.
 
 #### Statically linking a custom OpenSSL build
 

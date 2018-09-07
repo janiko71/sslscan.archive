@@ -63,25 +63,26 @@
 #define printf_verbose(format, ...) if (options->verbose) printf(format, ##__VA_ARGS__)
 
 // Colour Console Output...
-#if !defined(_WIN32)
 // Always better to do "const char RESET[] = " because it saves relocation records.
-const char *RESET = "[0m";            // DEFAULT
-const char *COL_RED = "[31m";
-const char *COL_YELLOW = "[33m";
-const char *COL_BLUE = "[1;34m";
-const char *COL_GREEN = "[32m";
-const char *COL_PURPLE = "[35m";
-const char *COL_GREY = "[1;30m";
-const char *COL_RED_BG = "[41m";
+// Default colours were hard to read on Windows, so use lighter ones
+#ifdef _WIN32
+char *RESET = "[0m";            // DEFAULT
+char *COL_RED = "[91m";
+char *COL_YELLOW = "[93m";
+char *COL_BLUE = "[1;36m";
+char *COL_GREEN = "[92m";
+char *COL_PURPLE = "[95m";
+char *COL_GREY = "[1;30m";
+char *COL_RED_BG = "[41m";
 #else
-const char *RESET = "";
-const char *COL_RED = "";
-const char *COL_YELLOW = "";
-const char *COL_BLUE = "";
-const char *COL_GREEN = "";
-const char *COL_PURPLE = "";
-const char *COL_GREY = "";
-const char *COL_RED_BG = "";
+char *RESET = "[0m";            // DEFAULT
+char *COL_RED = "[31m";
+char *COL_YELLOW = "[33m";
+char *COL_BLUE = "[1;34m";
+char *COL_GREEN = "[32m";
+char *COL_PURPLE = "[35m";
+char *COL_GREY = "[1;30m";
+char *COL_RED_BG = "[41m";
 #endif
 
 #ifdef _WIN32
@@ -115,6 +116,7 @@ struct sslCheckOptions
     // Program Options...
     char host[512];
     char sniname[512];
+    char addrstr[INET6_ADDRSTRLEN];
     int port;
     int showCertificate;
     int checkCertificate;
@@ -133,6 +135,7 @@ struct sslCheckOptions
     int starttls_ldap;
     int starttls_pop3;
     int starttls_smtp;
+    int starttls_mysql;
     int starttls_xmpp;
     int starttls_psql;
     int xmpp_server;

@@ -64,6 +64,25 @@
 
     // Visual Studio doesn't have ssize_t...
     typedef int ssize_t;
+  #else
+    void *memmem(const void *haystack_start, size_t haystack_len, const void *needle, size_t needle_len);
+    /* Taken from https://sourceforge.net/p/mingw/bugs/_discuss/thread/ec0291f1/93ae/attachment/patchset-wrapped.diff:*/
+    #define timersub(a, b, result) \
+    do { \
+        (result)->tv_sec = (a)->tv_sec - (b)->tv_sec; \
+        (result)->tv_usec = (a)->tv_usec - (b)->tv_usec; \
+        if ((result)->tv_usec < 0) { \
+            --(result)->tv_sec; \
+            (result)->tv_usec += 1000000L; \
+        } \
+    } while (0)
+ 
+    #ifdef BUILD_32BIT
+      #include "win32bit-compat.h"
+    #endif
+  #endif
+  #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
   #endif
 #else
   #include <netdb.h>
@@ -78,6 +97,9 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/ocsp.h>
+#ifdef __linux__
+    #include <arpa/inet.h>
+#endif
 #ifndef OPENSSL_NO_COMP
   #include <openssl/comp.h>
 #endif
@@ -107,6 +129,28 @@ static int use_unsafe_renegotiation_flag = 0;
 
 /** Does output xml to stdout? */
 static int xml_to_stdout = 0;
+
+#if OPENSSL_VERSION_NUMBER < 0x1000100L
+unsigned long SSL_CIPHER_get_id(const SSL_CIPHER* cipher) { return cipher->id; }
+#endif
+
+// Helper function to recv from socket until EOF or an error
+static ssize_t recvall(int sockfd, void *buf, size_t len, int flags)
+{
+    size_t remaining = len;
+    char *bufptr = buf;
+    do
+    {
+        ssize_t actual = recv(sockfd, bufptr, remaining, flags);
+        if (actual <= 0) // premature eof or an error?
+        {
+            return actual;
+        }
+        bufptr += actual;
+        remaining -= actual;
+    } while (remaining != 0);
+    return (ssize_t) len;
+}
 
 // Adds Ciphers to the Cipher List structure
 int populateCipherList(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
@@ -193,7 +237,7 @@ int readOrLogAndClose(int fd, void* buffer, size_t len, const struct sslCheckOpt
     if (len < 2)
         return 1;
 
-    n = recv(fd, buffer, len - 1, 0);
+    n = recvall(fd, buffer, len - 1, 0);
 
     if (n < 0 && errno != 11) {
         printf_error("%s    ERROR: error reading from %s:%d: %s%s\n", COL_RED, options->host, options->port, strerror(errno), RESET);
@@ -268,7 +312,7 @@ int tcpConnect(struct sslCheckOptions *options)
 
     if(status < 0)
     {
-        printf_error("%sERROR: Could not open a connection to host %s on port %d.%s\n", COL_RED, options->host, options->port, RESET);
+        printf_error("%sERROR: Could not open a connection to host %s (%s) on port %d.%s\n", COL_RED, options->host, options->addrstr, options->port, RESET);
         close(socketDescriptor);
         return 0;
     }
@@ -306,10 +350,25 @@ int tcpConnect(struct sslCheckOptions *options)
         }
     }
 
+    if (options->starttls_mysql == true && tlsStarted == false)
+    {
+        tlsStarted = 1;
+        // Taken from https://github.com/tetlowgm/sslscan/blob/master/sslscan.c
+
+        const char mysqlssl[] = { 0x20, 0x00, 0x00, 0x01, 0x85, 0xae, 0x7f, 0x00, 
+            0x00, 0x00, 0x00, 0x01, 0x21, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00};
+
+        if (!readOrLogAndClose(socketDescriptor, buffer, BUFFERSIZE, options))
+            return 0;
+        send(socketDescriptor, mysqlssl, sizeof(mysqlssl), 0);
+    }
+
     // We could use an XML parser but frankly it seems like a security disaster
     if (options->starttls_xmpp == true && tlsStarted == false)
     {
-
         /* This is so ghetto, you cannot release it! */
         char xmpp_setup[1024]; // options->host is 512 bytes long
         /* XXX: TODO - options->host isn't always the host you want to test
@@ -509,7 +568,7 @@ int tcpConnect(struct sslCheckOptions *options)
         send(socketDescriptor, "\x00\x00\x00\x08\x04\xd2\x16\x2f", 8, 0);
 
         // Read reply byte
-        if (1 != recv(socketDescriptor, &buffer, 1, 0)) {
+        if (1 != recvall(socketDescriptor, &buffer, 1, 0)) {
             printf_error("%s    ERROR: unexpected EOF reading from %s:%d%s\n", COL_RED, options->host, options->port, RESET);
             return 0;
         }
@@ -533,7 +592,7 @@ int tcpConnect(struct sslCheckOptions *options)
         send(socketDescriptor, "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00", 19, 0);
 
         // Read reply header
-        if (4 != recv(socketDescriptor, buffer, 4, 0)) {
+        if (4 != recvall(socketDescriptor, buffer, 4, 0)) {
             printf_error("%s    ERROR: unexpected EOF reading from %s:%d%s\n", COL_RED, options->host, options->port, RESET);
             return 0;
         }
@@ -547,7 +606,7 @@ int tcpConnect(struct sslCheckOptions *options)
         }
 
         // Read reply data
-        if (readlen != recv(socketDescriptor, buffer, readlen, 0)) {
+        if (readlen != recvall(socketDescriptor, buffer, readlen, 0)) {
             printf_error("%s    ERROR: unexpected EOF reading from %s:%d%s\n", COL_RED, options->host, options->port, RESET);
             return 0;
         }
@@ -960,17 +1019,19 @@ int testFallback(struct sslCheckOptions *options,  const SSL_METHOD *sslMethod)
                             if (!downgraded)
                             {
                                 sslversion = SSL_version(ssl);
+#if OPENSSL_VERSION_NUMBER >= 0x10001000L
                                 if (sslversion == TLS1_2_VERSION)
                                 {
                                     secondMethod = TLSv1_1_client_method();
                                 }
-                                else if (sslversion == TLS1_VERSION)
+                                else if (sslversion == TLS1_1_VERSION)
                                 {
                                     secondMethod = TLSv1_client_method();
-                                }
-                                else if (sslversion == TLS1_VERSION)
+                                } else
+#endif
+                                if (sslversion == TLS1_VERSION)
                                 {
-                                    printf("Server only supports TLSv1.0");
+                                    printf("Server only supports TLSv1.0\n\n");
                                     status = false;
                                 }
                                 else
@@ -982,6 +1043,7 @@ int testFallback(struct sslCheckOptions *options,  const SSL_METHOD *sslMethod)
                             else
                             {
                                 printf("Server %sdoes not%s support TLS Fallback SCSV\n\n", COL_RED, RESET);
+                                printf_xml("  <fallback supported=\"0\" />\n");
                             }
                         }
                         else
@@ -994,6 +1056,7 @@ int testFallback(struct sslCheckOptions *options,  const SSL_METHOD *sslMethod)
                                     if (SSL_get_error(ssl, connStatus == 6))
                                     {
                                         printf("Server %ssupports%s TLS Fallback SCSV\n\n", COL_GREEN, RESET);
+                                        printf_xml("  <fallback supported=\"1\" />\n");
                                         status = false;
                                     }
                                 }
@@ -1164,14 +1227,14 @@ int testRenegotiation(struct sslCheckOptions *options, const SSL_METHOD *sslMeth
                                 printf_verbose("Attempting SSL_do_handshake(ssl)\n");
                                 SSL_do_handshake(ssl); // Send renegotiation request to server //TODO :: XXX hanging here
 
-                                if (ssl->state == SSL_ST_OK)
+                                if (SSL_get_state(ssl) == SSL_ST_OK)
                                 {
                                     res = SSL_do_handshake(ssl); // Send renegotiation request to server
                                     if( res != 1 )
                                     {
                                         printf_error("\n\nSSL_do_handshake() call failed\n");
                                     }
-                                    if (ssl->state == SSL_ST_OK)
+                                    if (SSL_get_state(ssl) == SSL_ST_OK)
                                     {
                                         /* our renegotiation is complete */
                                         renOut->supported = true;
@@ -1261,6 +1324,7 @@ const char* printableSslMethod(const SSL_METHOD *sslMethod)
 }
 
 // Test for Heartbleed
+
 int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
 {
     // Variables...
@@ -1324,7 +1388,7 @@ int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
             memset(hbbuf, 0, sizeof(hbbuf));
 
             // Read 5 byte header
-            int readResult = recv(socketDescriptor, hbbuf, 5, 0);
+            int readResult = recvall(socketDescriptor, hbbuf, 5, 0);
             if (readResult <= 0)
             {
                 break;
@@ -1343,7 +1407,7 @@ int testHeartbleed(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
             memset(hbbuf, 0, sizeof(hbbuf));
 
             // Read rest of record
-            readResult = recv(socketDescriptor, hbbuf, ln, 0);
+            readResult = recvall(socketDescriptor, hbbuf, ln, 0);
             if (readResult <= 0)
             {
                 break;
@@ -1516,8 +1580,8 @@ int testCipher(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
                     return false;
                 }
 
-		cipherid = SSL_CIPHER_get_id(sslCipherPointer);
-		cipherid = cipherid & 0x00ffffff;  // remove first byte which is the version (0x03 for TLSv1/SSLv3)
+                cipherid = SSL_CIPHER_get_id(sslCipherPointer);
+                cipherid = cipherid & 0x00ffffff;  // remove first byte which is the version (0x03 for TLSv1/SSLv3)
 
                 // Show Cipher Status
                 printf_xml("  <cipher status=\"");
@@ -1649,11 +1713,7 @@ int testCipher(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
                     printf("%s%-29s%s", COL_PURPLE, sslCipherPointer->name, RESET);
 		    overallSafety = XML_PURPLE;
                 }
-                else if (strstr(sslCipherPointer->name, "EXP")
-#ifndef OPENSSL_NO_SSL3
-                        || (strcmp(cleanSslMethod, "SSLv3") == 0 && !strstr(sslCipherPointer->name, "RC4"))
-#endif
-                        )
+                else if (strstr(sslCipherPointer->name, "EXP"))
                 {
                     printf("%s%-29s%s", COL_RED, sslCipherPointer->name, RESET);
 		    overallSafety = XML_RED;
@@ -1663,7 +1723,8 @@ int testCipher(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
                     printf("%s%-29s%s", COL_YELLOW, sslCipherPointer->name, RESET);
 		    overallSafety = XML_YELLOW;
                 }
-                else if (strstr(sslCipherPointer->name, "GCM") && strstr(sslCipherPointer->name, "DHE"))
+                else if ((strstr(sslCipherPointer->name, "CHACHA20") || (strstr(sslCipherPointer->name, "GCM")))
+                        && strstr(sslCipherPointer->name, "DHE"))
                 {
                     printf("%s%-29s%s", COL_GREEN, sslCipherPointer->name, RESET);
 		    overallSafety = XML_GREEN;
@@ -1853,13 +1914,9 @@ int checkCertificate(struct sslCheckOptions *options, const SSL_METHOD *sslMetho
                                     printf("Signature Algorithm: ");
                                     i2t_ASN1_OBJECT(certAlgorithm, sizeof(certAlgorithm), x509Cert->cert_info->signature->algorithm);
                                     strtok(certAlgorithm, "\n");
-                                    if (strstr(certAlgorithm, "md5"))
+                                    if (strstr(certAlgorithm, "md5") || strstr(certAlgorithm, "sha1"))
                                     {
                                         printf("%s%s%s\n", COL_RED, certAlgorithm, RESET);
-                                    }
-                                    else if (strstr(certAlgorithm, "sha1"))
-                                    {
-                                        printf("%s%s%s\n", COL_YELLOW, certAlgorithm, RESET);
                                     }
                                     else if (strstr(certAlgorithm, "sha512") || strstr(certAlgorithm, "sha256"))
                                     {
@@ -2464,7 +2521,7 @@ int showCertificate(struct sslCheckOptions *options)
 #endif
         else {
             printf_verbose("sslMethod = TLSv1_method()\n");
-            printf_verbose("If server doesn't support TLSv1.0, manually specificy TLS version\n");
+            printf_verbose("If server doesn't support TLSv1.0, manually specify TLS version\n");
             sslMethod = TLSv1_method();
         }
         options->ctx = SSL_CTX_new(sslMethod);
@@ -2907,7 +2964,7 @@ int showTrustedCAs(struct sslCheckOptions *options)
 #endif
         else {
             printf_verbose("sslMethod = TLSv1_method()\n");
-            printf_verbose("If server doesn't support TLSv1.0, manually specificy TLS version\n");
+            printf_verbose("If server doesn't support TLSv1.0, manually specify TLS version\n");
             sslMethod = TLSv1_method();
         }
         options->ctx = SSL_CTX_new(sslMethod);
@@ -3032,13 +3089,15 @@ int testConnection(struct sslCheckOptions *options)
 {
     // Variables...
     int socketDescriptor = 0;
+    struct addrinfo *ai;
     struct addrinfo *addrinfoResult = NULL;
     struct addrinfo hints;
 
     memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
 
     // Resolve Host Name
-    options->h_addrtype = 0;
     if (options->ipv4 && options->ipv6)
     {
        // If both IPv4 and IPv6 are enabled, we restrict nothing in the
@@ -3062,31 +3121,35 @@ int testConnection(struct sslCheckOptions *options)
     }
 
     // Configure Server Address and Port
-    if (addrinfoResult->ai_family == AF_INET6)
+    for (ai = addrinfoResult; ai != NULL; ai = ai->ai_next)
     {
-        options->serverAddress6.sin6_family = addrinfoResult->ai_family;
-        memcpy((char *) &options->serverAddress6, addrinfoResult->ai_addr, addrinfoResult->ai_addrlen);
-        options->serverAddress6.sin6_port = htons(options->port);
+        if (ai->ai_family == AF_INET6)
+        {
+            options->serverAddress6.sin6_family = ai->ai_family;
+            memcpy((char *) &options->serverAddress6, ai->ai_addr, ai->ai_addrlen);
+            options->serverAddress6.sin6_port = htons(options->port);
+            inet_ntop(ai->ai_family, &options->serverAddress6.sin6_addr, options->addrstr, sizeof(options->addrstr));
+        }
+        else
+        {
+            options->serverAddress.sin_family = ai->ai_family;
+            memcpy((char *) &options->serverAddress, ai->ai_addr, ai->ai_addrlen);
+            options->serverAddress.sin_port = htons(options->port);
+            inet_ntop(ai->ai_family, &options->serverAddress.sin_addr, options->addrstr, sizeof(options->addrstr));
+        }
+        options->h_addrtype = ai->ai_family;
+
+        socketDescriptor = tcpConnect(options);
+        if (socketDescriptor != 0)
+        {
+            close(socketDescriptor);
+            freeaddrinfo(addrinfoResult); addrinfoResult = NULL;
+            printf("%sConnected to %s%s\n\n", COL_GREEN, options->addrstr, RESET);
+            return true;
+        }
     }
-    else
-    {
-        options->serverAddress.sin_family = addrinfoResult->ai_family;
-        memcpy((char *) &options->serverAddress, addrinfoResult->ai_addr, addrinfoResult->ai_addrlen);
-        options->serverAddress.sin_port = htons(options->port);
-    }
-    options->h_addrtype = addrinfoResult->ai_family;
     freeaddrinfo(addrinfoResult); addrinfoResult = NULL;
-    
-    socketDescriptor = tcpConnect(options);
-    if (socketDescriptor != 0)
-    {
-        close(socketDescriptor);
-        return true;
-    }
-    else
-    {
-        return false;
-    }
+    return false;
 }
 
 int testProtocolCiphers(struct sslCheckOptions *options, const SSL_METHOD *sslMethod)
@@ -3139,7 +3202,7 @@ int testHost(struct sslCheckOptions *options)
     int status = true;
     
     // XML Output...
-    printf_xml(" <ssltest host=\"%s\" port=\"%d\">\n", options->host, options->port);
+    printf_xml(" <ssltest host=\"%s\" sniname=\"%s\" port=\"%d\">\n", options->host, options->sniname, options->port);
 
     // Verbose warning about STARTTLS and SSLv3
     if (options->sslVersion == ssl_v3 || options->sslVersion == ssl_all)
@@ -3147,8 +3210,8 @@ int testHost(struct sslCheckOptions *options)
         printf_verbose("Some servers will fail to response to SSLv3 ciphers over STARTTLS\nIf your scan hangs, try using the --tlsall option\n\n");
     }
 
-    // Test renegotiation
-    printf("Testing SSL server %s%s%s on port %s%d%s\n\n", COL_GREEN, options->host, RESET, COL_GREEN, options->port, RESET);
+    printf("Testing SSL server %s%s%s on port %s%d%s using SNI name %s%s%s\n\n", COL_GREEN, options->host, RESET,
+            COL_GREEN, options->port, RESET, COL_GREEN, options->sniname, RESET);
 
     if (options->showClientCiphers == true)
     {
@@ -3385,6 +3448,8 @@ int main(int argc, char *argv[])
     WORD wVersionRequested;
     WSADATA wsaData;
     int err;
+    HANDLE hConsole;
+    DWORD consoleMode;
 #endif
 
     // Init...
@@ -3409,6 +3474,7 @@ int main(int argc, char *argv[])
     options.starttls_ldap = false;
     options.starttls_pop3 = false;
     options.starttls_smtp = false;
+    options.starttls_mysql = false;
     options.starttls_xmpp = false;
     options.starttls_psql = false;
     options.xmpp_server = false;
@@ -3426,6 +3492,21 @@ int main(int argc, char *argv[])
     options.sslVersion = ssl_all;
 
 #ifdef _WIN32
+    /* Attempt to enable console colors.  This succeeds in Windows 10.  For other
+     * OSes, color is disabled. */
+    hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    if ((hConsole == INVALID_HANDLE_VALUE) || (!GetConsoleMode(hConsole, &consoleMode)) || (!SetConsoleMode(hConsole, consoleMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))) {
+        RESET = "";
+        COL_RED = "";
+        COL_YELLOW = "";
+        COL_BLUE = "";
+        COL_GREEN = "";
+        COL_PURPLE = "";
+        COL_GREY = "";
+        COL_RED_BG = "";
+    }
+
+    /* Initialize networking library. */
     wVersionRequested = MAKEWORD(2, 2);
     err = WSAStartup(wVersionRequested, &wsaData);
     if (err != 0)
@@ -3507,6 +3588,7 @@ int main(int argc, char *argv[])
             COL_GREEN = "";
             COL_PURPLE = "";
             COL_RED_BG = "";
+            COL_GREY = "";
         }
 
         // Client Certificates
@@ -3563,6 +3645,10 @@ int main(int argc, char *argv[])
         // StartTLS... SMTP
         else if (strcmp("--starttls-smtp", argv[argLoop]) == 0)
             options.starttls_smtp = true;
+
+        // StartTLS... MYSQL
+        else if (strcmp("--starttls-mysql", argv[argLoop]) == 0)
+            options.starttls_mysql = true;
 
         // StartTLS... XMPP
         else if (strcmp("--starttls-xmpp", argv[argLoop]) == 0)
@@ -3628,15 +3714,15 @@ int main(int argc, char *argv[])
             options.rdp = 1;
 
         // IPv4 only
-        else if (strcmp("--ipv4", argv[argLoop]) == 0)
+        else if ((strcmp("--ipv4", argv[argLoop]) == 0) || (strcmp("-4", argv[argLoop]) == 0))
             options.ipv6 = false;
 
         // IPv6 only
-        else if (strcmp("--ipv6", argv[argLoop]) == 0)
+        else if ((strcmp("--ipv6", argv[argLoop]) == 0) || (strcmp("-6", argv[argLoop]) == 0))
             options.ipv4 = false;
 
-		else if (strcmp("--ocsp", argv[argLoop]) == 0)
-			options.ocspStatus = true;
+        else if (strcmp("--ocsp", argv[argLoop]) == 0)
+            options.ocspStatus = true;
 
         // SNI name
         else if (strncmp("--sni-name=", argv[argLoop], 11) == 0)
@@ -3674,21 +3760,25 @@ int main(int argc, char *argv[])
                 hostString++;
             }
 
-            while ((hostString[tempInt] != 0) && ((squareBrackets == true && hostString[tempInt] != ']') || (squareBrackets == false && hostString[tempInt] != ':')))
+            while ((hostString[tempInt] != 0) && ((squareBrackets == true && hostString[tempInt] != ']')
+                        || (squareBrackets == false && hostString[tempInt] != ':')))
+            {
                 tempInt++;
+            }
 
-                if (squareBrackets == true && hostString[tempInt] == ']')
+            if (squareBrackets == true && hostString[tempInt] == ']')
+            {
+                hostString[tempInt] = 0;
+                if (tempInt < maxSize && hostString[tempInt + 1] == ':')
                 {
+                    tempInt++;
                     hostString[tempInt] = 0;
-                    if (tempInt < maxSize && hostString[tempInt + 1] == ':')
-                    {
-                        tempInt++;
-                        hostString[tempInt] = 0;
-                    }
                 }
-                else
-                    hostString[tempInt] = 0;
-
+            }
+            else
+            {
+                hostString[tempInt] = 0;
+            }
             strncpy(options.host, hostString, sizeof(options.host) -1);
 
             // No SNI name passed on command line
@@ -3722,6 +3812,8 @@ int main(int argc, char *argv[])
                     options.port = 110;
                 else if (options.starttls_smtp)
                     options.port = 25;
+                else if (options.starttls_mysql)
+                    options.port = 3306;
                 else if (options.starttls_xmpp)
                     options.port = 5222;
                 else if (options.starttls_psql)
@@ -3800,8 +3892,8 @@ int main(int argc, char *argv[])
             printf("  %s--targets=<file>%s     A file containing a list of hosts to check.\n", COL_GREEN, RESET);
             printf("                       Hosts can  be supplied  with ports (host:port)\n");
             printf("  %s--sni-name=<name>%s    Hostname for SNI\n", COL_GREEN, RESET);
-            printf("  %s--ipv4%s               Only use IPv4\n", COL_GREEN, RESET);
-            printf("  %s--ipv6%s               Only use IPv6\n", COL_GREEN, RESET);
+            printf("  %s--ipv4, -4%s           Only use IPv4\n", COL_GREEN, RESET);
+            printf("  %s--ipv6, -6%s           Only use IPv6\n", COL_GREEN, RESET);
             printf("  %s--show-certificate%s   Show full certificate information\n", COL_GREEN, RESET);
             printf("  %s--no-check-certificate%s  Don't warn about weak certificate algorithm or keys\n", COL_GREEN, RESET);
             printf("  %s--show-client-cas%s    Show trusted CAs for TLS client auth\n", COL_GREEN, RESET);
@@ -3838,6 +3930,7 @@ int main(int argc, char *argv[])
             printf("  %s--starttls-ldap%s      STARTTLS setup for LDAP\n", COL_GREEN, RESET);
             printf("  %s--starttls-pop3%s      STARTTLS setup for POP3\n", COL_GREEN, RESET);
             printf("  %s--starttls-smtp%s      STARTTLS setup for SMTP\n", COL_GREEN, RESET);
+            printf("  %s--starttls-mysql%s     STARTTLS setup for MYSQL\n", COL_GREEN, RESET);
             printf("  %s--starttls-xmpp%s      STARTTLS setup for XMPP\n", COL_GREEN, RESET);
             printf("  %s--starttls-psql%s      STARTTLS setup for PostgreSQL\n", COL_GREEN, RESET);
             printf("  %s--xmpp-server%s        Use a server-to-server XMPP handshake\n", COL_GREEN, RESET);
@@ -3917,7 +4010,18 @@ int main(int argc, char *argv[])
                                 tempInt++;
                                 if (strlen(line + tempInt) > 0)
                                 {
-                                    options.port = atoi(line + tempInt);
+                                    int port;
+                                    port = atoi(line + tempInt);
+                                    // Invalid port
+                                    if (port == 0)
+                                    {
+                                        printf_error("%sERROR: Invalid port specified.%s", COL_RED, RESET);
+                                        exit(1);
+                                    }
+                                    else
+                                    {
+                                        options.port = port;
+                                    }
                                 }
                                 // Otherwise assume 443
                                 else
@@ -3959,5 +4063,30 @@ int main(int argc, char *argv[])
 
     return 0;
 }
+
+/* MinGW doesn't have a memmem() implementation. */
+#ifdef _WIN32
+
+/* Implementation taken from: https://sourceforge.net/p/mingw/msys2-runtime/ci/f21dc72d306bd98e55a08461a9530c4b0ce1dffe/tree/newlib/libc/string/memmem.c#l80 */
+/* Copyright (C) 2008 Eric Blake
+ * Permission to use, copy, modify, and distribute this software
+ * is freely granted, provided that this notice is preserved.*/
+void *memmem(const void *haystack_start, size_t haystack_len, const void *needle, size_t needle_len) {
+  const unsigned char *haystack = (const unsigned char *) haystack_start;
+  //const unsigned char *needle = (const unsigned char *) needle_start;
+
+  if (needle_len == 0)
+    return (void *)haystack;
+
+  while (needle_len <= haystack_len)
+    {
+      if (!memcmp (haystack, needle, needle_len))
+        return (void *) haystack;
+      haystack++;
+      haystack_len--;
+    }
+  return NULL;
+}
+#endif
 
 /* vim :set ts=4 sw=4 sts=4 et : */
